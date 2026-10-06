@@ -81,9 +81,12 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIntent(intent: Intent?) {
         when (intent?.action) {
+            DlnaCastingService.ACTION_OPEN_PLAYER -> castViewModel.setShowNowPlayingSheet(true)
             DlnaCastingService.ACTION_PLAY -> castViewModel.play()
             DlnaCastingService.ACTION_PAUSE -> castViewModel.pause()
             DlnaCastingService.ACTION_STOP -> castViewModel.stop()
+            DlnaCastingService.ACTION_PREVIOUS -> castViewModel.playPrevious()
+            DlnaCastingService.ACTION_NEXT -> castViewModel.playNext()
         }
     }
 

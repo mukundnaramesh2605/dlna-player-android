@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 class DlnaMediaServer(
     private val hostIp: String,
     val serverPort: Int = DEFAULT_PORT
-) : NanoHTTPD(hostIp, serverPort) {
+) : NanoHTTPD(null, serverPort) {
 
     private val mediaRegistry = ConcurrentHashMap<String, File>()
 
@@ -86,6 +86,18 @@ class DlnaMediaServer(
         val fileLength = file.length()
         val mimeType = FileItem.guessMimeType(file.extension)
         val rangeHeader = session.headers["range"]
+
+        if (session.method == Method.HEAD) {
+            val response = newFixedLengthResponse(
+                Response.Status.OK,
+                mimeType,
+                null,
+                fileLength
+            )
+            response.addHeader("Content-Length", fileLength.toString())
+            addDlnaHeaders(response)
+            return response
+        }
 
         try {
             if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {

@@ -48,6 +48,37 @@ object NetworkUtils {
     }
 
     /**
+     * Finds the local IP address on the interface matching the target device's /24 subnet.
+     * Prevents advertising cellular or VPN IPs to a TV on the local Wi-Fi subnet.
+     */
+    fun getLocalIpForTarget(targetIp: String?): String {
+        val fallback = getLocalIpAddress() ?: "127.0.0.1"
+        if (targetIp.isNullOrBlank()) return fallback
+
+        try {
+            val parts = targetIp.trim().split(".").take(3)
+            if (parts.size == 3) {
+                val targetPrefix = parts.joinToString(".") + "."
+                val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+                for (iface in interfaces) {
+                    if (iface.isLoopback || !iface.isUp) continue
+                    for (address in Collections.list(iface.inetAddresses)) {
+                        if (!address.isLoopbackAddress && address is Inet4Address) {
+                            val host = address.hostAddress ?: continue
+                            if (host.startsWith(targetPrefix)) {
+                                return host
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error matching local IP for target $targetIp", e)
+        }
+        return fallback
+    }
+
+    /**
      * Checks whether the device is currently connected to an active Wi-Fi network.
      */
     fun isWifiConnected(context: Context): Boolean {
@@ -57,6 +88,29 @@ object NetworkUtils {
         val capabilities = cm.getNetworkCapabilities(network) ?: return false
         return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
                 capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+
+    /**
+     * Retrieves all active non-loopback network interfaces supporting multicast with IPv4 addresses.
+     */
+    fun getAllActiveMulticastInterfaces(): List<NetworkInterface> {
+        return try {
+            Collections.list(NetworkInterface.getNetworkInterfaces()).filter { iface ->
+                !iface.isLoopback && iface.isUp &&
+                Collections.list(iface.inetAddresses).any { !it.isLoopbackAddress && it is Inet4Address }
+            }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Returns the /24 subnet prefix of the local IP (e.g. "192.168.1.").
+     */
+    fun getSubnetPrefix(): String? {
+        val ip = getLocalIpAddress() ?: return null
+        val lastDot = ip.lastIndexOf('.')
+        return if (lastDot != -1) ip.substring(0, lastDot + 1) else null
     }
 
     /**

@@ -62,14 +62,21 @@ class CastViewModel(
     init {
         bindCastingService()
 
-        // Sync service notification whenever playback state changes
+        // Sync service notification and error messages whenever playback state changes
         viewModelScope.launch {
+            var lastErrorMessage: String? = null
             playbackState.collect { state ->
                 castingService?.updateNotification(
                     mediaItem = state.currentMedia,
                     deviceName = state.targetDevice?.friendlyName,
                     state = state.transportState
                 )
+                if (state.errorMessage != null && state.errorMessage != lastErrorMessage) {
+                    lastErrorMessage = state.errorMessage
+                    showSnackbar(state.errorMessage)
+                } else if (state.errorMessage == null) {
+                    lastErrorMessage = null
+                }
             }
         }
 
@@ -85,6 +92,17 @@ class CastViewModel(
 
     fun startScan() {
         discovery.startDiscovery()
+    }
+
+    fun probeManualIp(ip: String) {
+        viewModelScope.launch {
+            val success = discovery.probeDeviceAtIp(ip)
+            if (success) {
+                showSnackbar("Found device at $ip")
+            } else {
+                showSnackbar("No DLNA device found at $ip")
+            }
+        }
     }
 
     fun selectDevice(device: DlnaDevice?) {

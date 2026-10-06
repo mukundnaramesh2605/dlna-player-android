@@ -102,18 +102,8 @@ class DlnaController(
                     )
                 }
 
-                // Ensure local HTTP media server is running on local IP
-                val localIp = NetworkUtils.getLocalIpAddress()
-                if (localIp == null) {
-                    _playbackState.update {
-                        it.copy(
-                            transportState = TransportState.ERROR,
-                            errorMessage = "No Wi-Fi/LAN connection found. Connect to Wi-Fi to cast."
-                        )
-                    }
-                    return@launch
-                }
-
+                // Ensure local HTTP media server is running on the IP matching the target device's subnet
+                val localIp = NetworkUtils.getLocalIpForTarget(device.ipAddress)
                 ensureMediaServerRunning(localIp)
 
                 val streamUrl = mediaServer?.registerMedia(fileItem.file)
@@ -127,38 +117,61 @@ class DlnaController(
                     return@launch
                 }
 
-                Log.d(TAG, "Streaming URL: $streamUrl -> ${device.friendlyName}")
+                Log.d(TAG, "Streaming URL: $streamUrl -> ${device.friendlyName} (${device.ipAddress})")
                 _playbackState.update { it.copy(streamUrl = streamUrl) }
 
-                // Stop any previous track on the renderer
-                soapClient.stop(device.avTransportControlUrl)
+                var activeControlUrl = device.avTransportControlUrl
+
+                // Best-effort stop any previous track on the renderer
+                soapClient.stop(activeControlUrl)
 
                 // Set URI with DIDL metadata
-                val setUriResult = soapClient.setAVTransportURI(device.avTransportControlUrl, streamUrl, fileItem)
+                var setUriResult = soapClient.setAVTransportURI(activeControlUrl, streamUrl, fileItem)
+                if (setUriResult.isFailure) {
+                    // Try alternative Samsung/UPnP port if primary URL failed
+                    val fallbackUrl = when {
+                        activeControlUrl.contains(":7676/") -> activeControlUrl.replace(Regex(":[0-9]+/.*"), ":9197/upnp/control/AVTransport1")
+                        activeControlUrl.contains(":9197/") -> activeControlUrl.replace(Regex(":[0-9]+/.*"), ":7676/smp_4_")
+                        else -> null
+                    }
+                    if (fallbackUrl != null) {
+                        Log.w(TAG, "Primary control URL failed. Retrying with fallback URL: $fallbackUrl")
+                        val fallbackResult = soapClient.setAVTransportURI(fallbackUrl, streamUrl, fileItem)
+                        if (fallbackResult.isSuccess) {
+                            activeControlUrl = fallbackUrl
+                            setUriResult = fallbackResult
+                            // Update device with the working control URL
+                            _playbackState.update { it.copy(targetDevice = device.copy(avTransportControlUrl = fallbackUrl)) }
+                        }
+                    }
+                }
+
                 if (setUriResult.isFailure) {
                     val err = setUriResult.exceptionOrNull()?.message ?: "Failed to set transport URI"
+                    Log.e(TAG, "SetAVTransportURI failed: $err")
                     _playbackState.update {
-                        it.copy(transportState = TransportState.ERROR, errorMessage = err)
+                        it.copy(transportState = TransportState.ERROR, errorMessage = "Renderer rejected media: $err")
                     }
                     return@launch
                 }
 
                 // Send Play
-                val playResult = soapClient.play(device.avTransportControlUrl)
+                val playResult = soapClient.play(activeControlUrl)
                 if (playResult.isFailure) {
                     val err = playResult.exceptionOrNull()?.message ?: "Failed to start playback"
+                    Log.e(TAG, "Play command failed: $err")
                     _playbackState.update {
-                        it.copy(transportState = TransportState.ERROR, errorMessage = err)
+                        it.copy(transportState = TransportState.ERROR, errorMessage = "Playback start failed: $err")
                     }
                     return@launch
                 }
 
-                _playbackState.update { it.copy(transportState = TransportState.PLAYING) }
-                startPoller(device.avTransportControlUrl)
+                _playbackState.update { it.copy(transportState = TransportState.PLAYING, errorMessage = null) }
+                startPoller(activeControlUrl)
             } catch (e: Exception) {
                 Log.e(TAG, "Error casting media", e)
                 _playbackState.update {
-                    it.copy(transportState = TransportState.ERROR, errorMessage = e.message)
+                    it.copy(transportState = TransportState.ERROR, errorMessage = e.message ?: "Playback error")
                 }
             }
         }
@@ -328,12 +341,16 @@ class DlnaController(
         pollerJob = null
     }
 
+    private var currentServerIp: String? = null
+
     private fun ensureMediaServerRunning(ip: String) {
-        if (mediaServer == null) {
+        if (mediaServer == null || currentServerIp != ip) {
             try {
+                mediaServer?.stop()
                 mediaServer = DlnaMediaServer(ip).apply {
                     start()
                 }
+                currentServerIp = ip
                 Log.i(TAG, "Started DlnaMediaServer at $ip:${mediaServer?.serverPort}")
             } catch (e: IOException) {
                 Log.e(TAG, "Failed to start DlnaMediaServer", e)

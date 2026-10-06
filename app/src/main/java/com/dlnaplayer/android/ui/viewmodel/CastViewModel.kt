@@ -51,6 +51,8 @@ class CastViewModel(
             val binder = service as? DlnaCastingService.LocalBinder
             castingService = binder?.getService()
             isBound = true
+            setupPlaybackControlListener()
+            castingService?.updateNotification(playbackState.value, hasNext(), hasPrevious())
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -59,7 +61,22 @@ class CastViewModel(
         }
     }
 
+    private val controlListener = object : DlnaCastingService.PlaybackControlListener {
+        override fun onPlay() = play()
+        override fun onPause() = pause()
+        override fun onStop() = stop()
+        override fun onNext() = playNext()
+        override fun onPrevious() = playPrevious()
+        override fun onSeekTo(positionMs: Long) = seekTo(positionMs)
+    }
+
+    private fun setupPlaybackControlListener() {
+        DlnaCastingService.controlListener = controlListener
+        castingService?.setPlaybackControlListener(controlListener)
+    }
+
     init {
+        setupPlaybackControlListener()
         bindCastingService()
 
         // Sync service notification and error messages whenever playback state changes
@@ -67,9 +84,9 @@ class CastViewModel(
             var lastErrorMessage: String? = null
             playbackState.collect { state ->
                 castingService?.updateNotification(
-                    mediaItem = state.currentMedia,
-                    deviceName = state.targetDevice?.friendlyName,
-                    state = state.transportState
+                    playbackState = state,
+                    hasNext = hasNext(),
+                    hasPrevious = hasPrevious()
                 )
                 if (state.errorMessage != null && state.errorMessage != lastErrorMessage) {
                     lastErrorMessage = state.errorMessage
@@ -194,6 +211,9 @@ class CastViewModel(
         super.onCleared()
         discovery.stopDiscovery()
         controller.release()
+        if (DlnaCastingService.controlListener === controlListener) {
+            DlnaCastingService.controlListener = null
+        }
         if (isBound) {
             getApplication<Application>().unbindService(serviceConnection)
             isBound = false

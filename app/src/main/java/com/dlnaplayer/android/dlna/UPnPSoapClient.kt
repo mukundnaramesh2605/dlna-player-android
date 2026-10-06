@@ -43,16 +43,57 @@ class UPnPSoapClient {
         mediaUrl: String,
         fileItem: FileItem
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        val metaData = buildDidlMetadata(mediaUrl, fileItem)
-        val body = """
+        // Attempt 1: Full DLNA DIDL metadata with DLNA.ORG flags and size
+        val fullMeta = buildFullDidlMetadata(mediaUrl, fileItem)
+        val bodyFull = """
             <u:SetAVTransportURI xmlns:u="$AV_TRANSPORT_SERVICE_TYPE">
                 <InstanceID>0</InstanceID>
                 <CurrentURI>${escapeXml(mediaUrl)}</CurrentURI>
-                <CurrentURIMetaData>${escapeXml(metaData)}</CurrentURIMetaData>
+                <CurrentURIMetaData>${escapeXml(fullMeta)}</CurrentURIMetaData>
             </u:SetAVTransportURI>
         """.trimIndent()
 
-        executeSoap(controlUrl, AV_TRANSPORT_SERVICE_TYPE, "SetAVTransportURI", body).map { }
+        val fullResult = executeSoap(controlUrl, AV_TRANSPORT_SERVICE_TYPE, "SetAVTransportURI", bodyFull)
+        if (fullResult.isSuccess) {
+            Log.d(TAG, "SetAVTransportURI succeeded with full DLNA metadata")
+            return@withContext Result.success(Unit)
+        }
+
+        // Attempt 2: Minimal DIDL metadata (generic protocolInfo)
+        Log.w(TAG, "Full DIDL metadata rejected (${fullResult.exceptionOrNull()?.message}). Retrying with simple DIDL...")
+        val simpleMeta = buildSimpleDidlMetadata(mediaUrl, fileItem)
+        val bodySimple = """
+            <u:SetAVTransportURI xmlns:u="$AV_TRANSPORT_SERVICE_TYPE">
+                <InstanceID>0</InstanceID>
+                <CurrentURI>${escapeXml(mediaUrl)}</CurrentURI>
+                <CurrentURIMetaData>${escapeXml(simpleMeta)}</CurrentURIMetaData>
+            </u:SetAVTransportURI>
+        """.trimIndent()
+
+        val simpleResult = executeSoap(controlUrl, AV_TRANSPORT_SERVICE_TYPE, "SetAVTransportURI", bodySimple)
+        if (simpleResult.isSuccess) {
+            Log.d(TAG, "SetAVTransportURI succeeded with simple DIDL metadata")
+            return@withContext Result.success(Unit)
+        }
+
+        // Attempt 3: Empty metadata (for non-strict renderers)
+        Log.w(TAG, "Simple DIDL metadata rejected (${simpleResult.exceptionOrNull()?.message}). Retrying with empty metadata...")
+        val bodyEmpty = """
+            <u:SetAVTransportURI xmlns:u="$AV_TRANSPORT_SERVICE_TYPE">
+                <InstanceID>0</InstanceID>
+                <CurrentURI>${escapeXml(mediaUrl)}</CurrentURI>
+                <CurrentURIMetaData></CurrentURIMetaData>
+            </u:SetAVTransportURI>
+        """.trimIndent()
+
+        val emptyResult = executeSoap(controlUrl, AV_TRANSPORT_SERVICE_TYPE, "SetAVTransportURI", bodyEmpty)
+        if (emptyResult.isSuccess) {
+            Log.d(TAG, "SetAVTransportURI succeeded with empty metadata")
+            return@withContext Result.success(Unit)
+        }
+
+        val finalError = fullResult.exceptionOrNull() ?: simpleResult.exceptionOrNull() ?: emptyResult.exceptionOrNull()
+        Result.failure(finalError ?: Exception("SetAVTransportURI failed on $controlUrl"))
     }
 
     suspend fun play(controlUrl: String): Result<Unit> = withContext(Dispatchers.IO) {
@@ -187,14 +228,8 @@ class UPnPSoapClient {
         action: String,
         actionBody: String
     ): Result<String> {
-        val envelope = """
-            <?xml version="1.0" encoding="utf-8"?>
-            <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-                <s:Body>
-                    $actionBody
-                </s:Body>
-            </s:Envelope>
-        """.trimIndent()
+        // Construct strictly formatted SOAP envelope with zero leading whitespace before XML declaration
+        val envelope = "<?xml version=\"1.0\" encoding=\"utf-8\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>$actionBody</s:Body></s:Envelope>"
 
         val soapActionHeader = "\"$serviceType#$action\""
         val requestBody = envelope.toRequestBody("text/xml; charset=\"utf-8\"".toMediaType())
@@ -202,6 +237,7 @@ class UPnPSoapClient {
         val request = Request.Builder()
             .url(controlUrl)
             .addHeader("SOAPAction", soapActionHeader)
+            .addHeader("User-Agent", "Android DLNA/1.50 UPnP/1.0")
             .post(requestBody)
             .build()
 
@@ -214,16 +250,36 @@ class UPnPSoapClient {
                 val errorCode = extractTagValue(bodyString, "errorCode")
                 val errorDesc = extractTagValue(bodyString, "errorDescription")
                 val msg = if (errorCode != null) "UPnP Error $errorCode: $errorDesc" else "HTTP ${response.code}: $bodyString"
-                Log.w(TAG, "SOAP action $action failed: $msg")
+                Log.w(TAG, "SOAP action $action on $controlUrl failed: $msg")
                 Result.failure(Exception(msg))
             }
         } catch (e: Exception) {
-            Log.e(TAG, "SOAP action $action exception", e)
+            Log.e(TAG, "SOAP action $action exception on $controlUrl", e)
             Result.failure(e)
         }
     }
 
-    private fun buildDidlMetadata(mediaUrl: String, fileItem: FileItem): String {
+    private fun buildFullDidlMetadata(mediaUrl: String, fileItem: FileItem): String {
+        val upnpClass = when (fileItem.mediaType) {
+            MediaType.VIDEO -> "object.item.videoItem"
+            MediaType.AUDIO -> "object.item.audioItem.musicTrack"
+            MediaType.IMAGE -> "object.item.imageItem.photo"
+            MediaType.OTHER -> "object.item"
+        }
+        val mime = fileItem.mimeType ?: FileItem.guessMimeType(fileItem.extension)
+        val title = escapeXml(fileItem.name)
+        val sizeAttr = if (fileItem.size > 0) " size=\"${fileItem.size}\"" else ""
+        val protocolInfo = "http-get:*:$mime:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+                "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+                "<dc:title>$title</dc:title>" +
+                "<upnp:class>$upnpClass</upnp:class>" +
+                "<res protocolInfo=\"$protocolInfo\"$sizeAttr>$mediaUrl</res>" +
+                "</item></DIDL-Lite>"
+    }
+
+    private fun buildSimpleDidlMetadata(mediaUrl: String, fileItem: FileItem): String {
         val upnpClass = when (fileItem.mediaType) {
             MediaType.VIDEO -> "object.item.videoItem"
             MediaType.AUDIO -> "object.item.audioItem.musicTrack"
@@ -233,15 +289,12 @@ class UPnPSoapClient {
         val mime = fileItem.mimeType ?: FileItem.guessMimeType(fileItem.extension)
         val title = escapeXml(fileItem.name)
 
-        return """
-            <DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
-                <item id="1" parentID="0" restricted="1">
-                    <dc:title>$title</dc:title>
-                    <upnp:class>$upnpClass</upnp:class>
-                    <res protocolInfo="http-get:*:$mime:*">$mediaUrl</res>
-                </item>
-            </DIDL-Lite>
-        """.trimIndent()
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+                "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
+                "<dc:title>$title</dc:title>" +
+                "<upnp:class>$upnpClass</upnp:class>" +
+                "<res protocolInfo=\"http-get:*:$mime:*\">$mediaUrl</res>" +
+                "</item></DIDL-Lite>"
     }
 
     private fun escapeXml(input: String): String {

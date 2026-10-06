@@ -247,6 +247,7 @@ fun MainContent(
             onSelectDevice = { castViewModel.selectDevice(it) },
             onDisconnect = { castViewModel.disconnect() },
             onRefreshScan = { castViewModel.startScan() },
+            onProbeManualIp = { castViewModel.probeManualIp(it) },
             onDismiss = { castViewModel.setShowDevicePicker(false) }
         )
     }

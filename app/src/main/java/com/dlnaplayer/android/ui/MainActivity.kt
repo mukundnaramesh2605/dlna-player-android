@@ -39,17 +39,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import android.provider.OpenableColumns
+import android.util.Log
+import androidx.compose.ui.platform.LocalContext
 import com.dlnaplayer.android.service.DlnaCastingService
 import com.dlnaplayer.android.ui.components.DevicePickerBottomSheet
 import com.dlnaplayer.android.ui.components.FolderBrowserScreen
 import com.dlnaplayer.android.ui.components.MiniPlayerBar
 import com.dlnaplayer.android.ui.components.NowPlayingSheet
 import com.dlnaplayer.android.ui.components.PermissionScreen
+import com.dlnaplayer.android.ui.components.SubtitleSelectionBottomSheet
 import com.dlnaplayer.android.ui.theme.CastAccent
 import com.dlnaplayer.android.ui.theme.CastConnected
 import com.dlnaplayer.android.ui.theme.DLNAPlayerTheme
 import com.dlnaplayer.android.ui.viewmodel.CastViewModel
 import com.dlnaplayer.android.ui.viewmodel.FileBrowserViewModel
+import java.io.File
 
 class MainActivity : ComponentActivity() {
 
@@ -109,6 +114,7 @@ fun MainContent(
     val devices by castViewModel.discoveredDevices.collectAsState()
     val isScanning by castViewModel.isScanning.collectAsState()
 
+    val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Runtime permission launcher for storage/media fallback
@@ -116,6 +122,38 @@ fun MainContent(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         fileBrowserViewModel.checkPermission()
+    }
+
+    // External subtitle (.srt, .vtt) document picker launcher
+    val subtitleFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        uri?.let {
+            try {
+                val contentResolver = context.contentResolver
+                val displayName = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (cursor.moveToFirst() && nameIndex >= 0) cursor.getString(nameIndex) else "external.srt"
+                } ?: "external.srt"
+
+                val cacheDir = File(context.cacheDir, "subtitles").apply { mkdirs() }
+                val cacheFile = File(cacheDir, "custom_${System.currentTimeMillis()}_$displayName")
+                contentResolver.openInputStream(uri)?.use { input ->
+                    cacheFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                if (cacheFile.exists() && cacheFile.length() > 0) {
+                    castViewModel.loadExternalSubtitle(cacheFile)
+                    castViewModel.setShowSubtitlePicker(false)
+                } else {
+                    castViewModel.showSnackbar("Could not read selected subtitle file")
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error reading subtitle file", e)
+                castViewModel.showSnackbar("Failed to open subtitle: ${e.message}")
+            }
+        }
     }
 
     // Intercept back button to navigate up folder hierarchy
@@ -215,7 +253,15 @@ fun MainContent(
                         castViewModel.castFile(fileItem, fileState.items)
                     },
                     onNonCastableClicked = { fileItem ->
-                        castViewModel.showSnackbar("${fileItem.name} cannot be played on TV: DLNA only streams audio, video, and photos.")
+                        if (fileItem.extension in setOf("srt", "vtt", "sub")) {
+                            if (playbackState.hasActiveMedia) {
+                                castViewModel.loadExternalSubtitle(fileItem.file)
+                            } else {
+                                castViewModel.showSnackbar("${fileItem.name} is a subtitle file. Start casting a video first to attach subtitles.")
+                            }
+                        } else {
+                            castViewModel.showSnackbar("${fileItem.name} cannot be played on TV: DLNA only streams audio, video, and photos.")
+                        }
                     },
                     onSearchChanged = { fileBrowserViewModel.onSearchQueryChanged(it) },
                     onToggleSearch = { fileBrowserViewModel.toggleSearch(it) },
@@ -269,7 +315,25 @@ fun MainContent(
             onPrevious = { castViewModel.playPrevious() },
             onSetVolume = { castViewModel.setVolume(it) },
             onToggleMute = { castViewModel.toggleMute() },
+            onOpenSubtitles = { castViewModel.setShowSubtitlePicker(true) },
             onDismiss = { castViewModel.setShowNowPlayingSheet(false) }
+        )
+    }
+
+    // Subtitle Selection Modal Bottom Sheet
+    if (castUiState.showSubtitlePicker) {
+        SubtitleSelectionBottomSheet(
+            availableSubtitles = playbackState.availableSubtitles,
+            selectedSubtitle = playbackState.selectedSubtitle,
+            isExtracting = playbackState.isExtractingSubtitle,
+            onSelectSubtitle = { track ->
+                castViewModel.selectSubtitle(track)
+                castViewModel.setShowSubtitlePicker(false)
+            },
+            onPickExternalFile = {
+                subtitleFilePicker.launch(arrayOf("*/*", "text/*", "application/x-subrip"))
+            },
+            onDismiss = { castViewModel.setShowSubtitlePicker(false) }
         )
     }
 }

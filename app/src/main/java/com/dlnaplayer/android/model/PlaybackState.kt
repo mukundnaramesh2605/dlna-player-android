@@ -24,10 +24,16 @@ data class PlaybackState(
     val volume: Int = 50,
     val isMuted: Boolean = false,
     val streamUrl: String? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val availableSubtitles: List<SubtitleTrack> = emptyList(),
+    val selectedSubtitle: SubtitleTrack = SubtitleTrack.NONE,
+    val isExtractingSubtitle: Boolean = false
 ) {
     val isPlaying: Boolean
         get() = transportState == TransportState.PLAYING
+
+    val hasActiveSubtitle: Boolean
+        get() = selectedSubtitle.source !is SubtitleSource.None
 
     val isBufferingOrTransitioning: Boolean
         get() = transportState == TransportState.CONNECTING || transportState == TransportState.TRANSITIONING

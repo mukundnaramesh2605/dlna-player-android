@@ -41,10 +41,11 @@ class UPnPSoapClient {
     suspend fun setAVTransportURI(
         controlUrl: String,
         mediaUrl: String,
-        fileItem: FileItem
+        fileItem: FileItem,
+        subtitleUrl: String? = null
     ): Result<Unit> = withContext(Dispatchers.IO) {
         // Attempt 1: Full DLNA DIDL metadata with DLNA.ORG flags and size
-        val fullMeta = buildFullDidlMetadata(mediaUrl, fileItem)
+        val fullMeta = buildFullDidlMetadata(mediaUrl, fileItem, subtitleUrl)
         val bodyFull = """
             <u:SetAVTransportURI xmlns:u="$AV_TRANSPORT_SERVICE_TYPE">
                 <InstanceID>0</InstanceID>
@@ -55,13 +56,13 @@ class UPnPSoapClient {
 
         val fullResult = executeSoap(controlUrl, AV_TRANSPORT_SERVICE_TYPE, "SetAVTransportURI", bodyFull)
         if (fullResult.isSuccess) {
-            Log.d(TAG, "SetAVTransportURI succeeded with full DLNA metadata")
+            Log.d(TAG, "SetAVTransportURI succeeded with full DLNA metadata (subtitles=${!subtitleUrl.isNullOrBlank()})")
             return@withContext Result.success(Unit)
         }
 
         // Attempt 2: Minimal DIDL metadata (generic protocolInfo)
         Log.w(TAG, "Full DIDL metadata rejected (${fullResult.exceptionOrNull()?.message}). Retrying with simple DIDL...")
-        val simpleMeta = buildSimpleDidlMetadata(mediaUrl, fileItem)
+        val simpleMeta = buildSimpleDidlMetadata(mediaUrl, fileItem, subtitleUrl)
         val bodySimple = """
             <u:SetAVTransportURI xmlns:u="$AV_TRANSPORT_SERVICE_TYPE">
                 <InstanceID>0</InstanceID>
@@ -259,7 +260,7 @@ class UPnPSoapClient {
         }
     }
 
-    private fun buildFullDidlMetadata(mediaUrl: String, fileItem: FileItem): String {
+    private fun buildFullDidlMetadata(mediaUrl: String, fileItem: FileItem, subtitleUrl: String? = null): String {
         val upnpClass = when (fileItem.mediaType) {
             MediaType.VIDEO -> "object.item.videoItem"
             MediaType.AUDIO -> "object.item.audioItem.musicTrack"
@@ -271,15 +272,25 @@ class UPnPSoapClient {
         val sizeAttr = if (fileItem.size > 0) " size=\"${fileItem.size}\"" else ""
         val protocolInfo = "http-get:*:$mime:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
-        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+        val subXml = if (!subtitleUrl.isNullOrBlank()) {
+            val escapedSub = escapeXml(subtitleUrl)
+            "<res protocolInfo=\"http-get:*:text/srt:*\">$escapedSub</res>" +
+            "<sec:CaptionInfo sec:type=\"srt\">$escapedSub</sec:CaptionInfo>" +
+            "<sec:CaptionInfoEx sec:type=\"srt\">$escapedSub</sec:CaptionInfoEx>"
+        } else ""
+
+        val secNs = if (!subtitleUrl.isNullOrBlank()) " xmlns:sec=\"http://www.sec.co.kr/\"" else ""
+
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"$secNs>" +
                 "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
                 "<dc:title>$title</dc:title>" +
                 "<upnp:class>$upnpClass</upnp:class>" +
                 "<res protocolInfo=\"$protocolInfo\"$sizeAttr>$mediaUrl</res>" +
+                subXml +
                 "</item></DIDL-Lite>"
     }
 
-    private fun buildSimpleDidlMetadata(mediaUrl: String, fileItem: FileItem): String {
+    private fun buildSimpleDidlMetadata(mediaUrl: String, fileItem: FileItem, subtitleUrl: String? = null): String {
         val upnpClass = when (fileItem.mediaType) {
             MediaType.VIDEO -> "object.item.videoItem"
             MediaType.AUDIO -> "object.item.audioItem.musicTrack"
@@ -289,11 +300,20 @@ class UPnPSoapClient {
         val mime = fileItem.mimeType ?: FileItem.guessMimeType(fileItem.extension)
         val title = escapeXml(fileItem.name)
 
-        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+        val subXml = if (!subtitleUrl.isNullOrBlank()) {
+            val escapedSub = escapeXml(subtitleUrl)
+            "<res protocolInfo=\"http-get:*:text/srt:*\">$escapedSub</res>" +
+            "<sec:CaptionInfo sec:type=\"srt\">$escapedSub</sec:CaptionInfo>"
+        } else ""
+
+        val secNs = if (!subtitleUrl.isNullOrBlank()) " xmlns:sec=\"http://www.sec.co.kr/\"" else ""
+
+        return "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"$secNs>" +
                 "<item id=\"1\" parentID=\"0\" restricted=\"1\">" +
                 "<dc:title>$title</dc:title>" +
                 "<upnp:class>$upnpClass</upnp:class>" +
                 "<res protocolInfo=\"http-get:*:$mime:*\">$mediaUrl</res>" +
+                subXml +
                 "</item></DIDL-Lite>"
     }
 

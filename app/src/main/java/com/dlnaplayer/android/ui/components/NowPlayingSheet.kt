@@ -1,6 +1,7 @@
 package com.dlnaplayer.android.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +21,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Forward30
 import androidx.compose.material.icons.filled.Movie
@@ -76,6 +78,7 @@ fun NowPlayingSheet(
     onPrevious: () -> Unit,
     onSetVolume: (Int) -> Unit,
     onToggleMute: () -> Unit,
+    onOpenSubtitles: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val media = playbackState.currentMedia ?: return
@@ -102,7 +105,10 @@ fun NowPlayingSheet(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f, fill = false),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
                         imageVector = Icons.Default.CastConnected,
                         contentDescription = null,
@@ -114,12 +120,59 @@ fun NowPlayingSheet(
                         text = device?.friendlyName ?: "DLNA Renderer",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = FontWeight.SemiBold,
-                        color = CastConnected
+                        color = CastConnected,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
-                IconButton(onClick = onDismiss) {
-                    Icon(imageVector = Icons.Default.Close, contentDescription = "Close sheet")
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Subtitle / Closed Caption Button for Video
+                    if (media.mediaType == MediaType.VIDEO) {
+                        val hasSub = playbackState.hasActiveSubtitle
+                        val subColor = if (hasSub) CastAccent else MaterialTheme.colorScheme.onSurfaceVariant
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onOpenSubtitles),
+                            color = if (hasSub) CastAccent.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (playbackState.isExtractingSubtitle) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 2.dp,
+                                        color = CastAccent
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.ClosedCaption,
+                                        contentDescription = "Subtitles",
+                                        tint = subColor,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = if (hasSub) {
+                                        playbackState.selectedSubtitle.language?.uppercase() ?: "CC ON"
+                                    } else "CC",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = subColor
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+
+                    IconButton(onClick = onDismiss) {
+                        Icon(imageVector = Icons.Default.Close, contentDescription = "Close sheet")
+                    }
                 }
             }
 

@@ -8,13 +8,15 @@ import java.io.FileInputStream
 import java.io.IOException
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Embedded HTTP server powered by NanoHTTPD to stream local media files to DLNA renderers.
+ * Embedded HTTP server powered by NanoHTTPD to stream local media files and subtitles to DLNA renderers.
  * Supports:
  *  - HTTP byte-range requests (RFC 7233) for seeking in audio and video files.
  *  - DLNA streaming headers (transferMode.dlna.org, contentFeatures.dlna.org).
+ *  - Serving external and extracted subtitle files (.srt, .vtt) with Samsung SEC caption headers.
  *  - Dynamic URL mapping for served files.
  */
 class DlnaMediaServer(
@@ -23,15 +25,44 @@ class DlnaMediaServer(
 ) : NanoHTTPD(null, serverPort) {
 
     private val mediaRegistry = ConcurrentHashMap<String, File>()
+    private val subtitleRegistry = ConcurrentHashMap<String, File>()
+
+    fun getMediaId(file: File): String {
+        return file.absolutePath.hashCode().toString().replace("-", "x")
+    }
 
     /**
      * Registers a file and returns the full HTTP streaming URL for the DLNA renderer.
      */
     fun registerMedia(file: File): String {
-        val id = file.absolutePath.hashCode().toString().replace("-", "x")
+        val id = getMediaId(file)
         mediaRegistry[id] = file
         val encodedName = URLEncoder.encode(file.name, "UTF-8").replace("+", "%20")
         return "http://$hostIp:$serverPort/media/$id/$encodedName"
+    }
+
+    /**
+     * Registers an active subtitle file for a media item.
+     * Returns the subtitle HTTP streaming URL, or null if cleared.
+     */
+    fun registerSubtitle(mediaId: String, subtitleFile: File?): String? {
+        if (subtitleFile == null || !subtitleFile.exists() || !subtitleFile.canRead()) {
+            subtitleRegistry.remove(mediaId)
+            return null
+        }
+        subtitleRegistry[mediaId] = subtitleFile
+        val encodedName = URLEncoder.encode(subtitleFile.name, "UTF-8").replace("+", "%20")
+        return "http://$hostIp:$serverPort/subtitles/$mediaId/$encodedName"
+    }
+
+    /**
+     * Returns the current subtitle URL for a media item if one is registered.
+     */
+    fun getSubtitleUrl(mediaId: String): String? {
+        val subFile = subtitleRegistry[mediaId] ?: return null
+        if (!subFile.exists() || !subFile.canRead()) return null
+        val encodedName = URLEncoder.encode(subFile.name, "UTF-8").replace("+", "%20")
+        return "http://$hostIp:$serverPort/subtitles/$mediaId/$encodedName"
     }
 
     override fun serve(session: IHTTPSession): Response {
@@ -42,7 +73,31 @@ class DlnaMediaServer(
             return newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, MIME_PLAINTEXT, "Method Not Allowed")
         }
 
-        // Match /media/{id}/{filename} or query param
+        val parts = uri.split("/").filter { it.isNotBlank() }
+
+        // 1. Handle dedicated subtitle request: /subtitles/{id}/{filename}
+        if (parts.size >= 2 && parts[0] == "subtitles") {
+            val id = parts[1]
+            val subFile = subtitleRegistry[id]
+            if (subFile != null && subFile.exists() && subFile.canRead()) {
+                return serveSubtitleFile(session, subFile)
+            }
+            return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Subtitle Not Found")
+        }
+
+        // 2. Handle sidecar subtitle request on media path: /media/{id}/*.srt or *.vtt
+        if (parts.size >= 2 && parts[0] == "media") {
+            val id = parts[1]
+            val requestedName = parts.getOrNull(2)?.lowercase(Locale.ROOT)
+            if (requestedName != null && (requestedName.endsWith(".srt") || requestedName.endsWith(".vtt") || requestedName.endsWith(".sub"))) {
+                val subFile = subtitleRegistry[id]
+                if (subFile != null && subFile.exists() && subFile.canRead()) {
+                    return serveSubtitleFile(session, subFile)
+                }
+            }
+        }
+
+        // 3. Match /media/{id}/{filename} or query param
         val targetFile = resolveRequestedFile(uri, session.parameters)
             ?: return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "File Not Found")
 
@@ -50,11 +105,13 @@ class DlnaMediaServer(
             return newFixedLengthResponse(Response.Status.FORBIDDEN, MIME_PLAINTEXT, "Cannot access file")
         }
 
-        return serveFileWithRanges(session, targetFile)
+        val mediaId = getMediaId(targetFile)
+        val activeSubtitleUrl = getSubtitleUrl(mediaId)
+
+        return serveFileWithRanges(session, targetFile, activeSubtitleUrl)
     }
 
     private fun resolveRequestedFile(uri: String, params: Map<String, List<String>>): File? {
-        // Try query param ?path=...
         val pathParam = params["path"]?.firstOrNull()
         if (!pathParam.isNullOrBlank()) {
             try {
@@ -66,7 +123,6 @@ class DlnaMediaServer(
             }
         }
 
-        // Try /media/{id}/...
         val parts = uri.split("/").filter { it.isNotBlank() }
         if (parts.size >= 2 && parts[0] == "media") {
             val id = parts[1]
@@ -80,9 +136,46 @@ class DlnaMediaServer(
     }
 
     /**
+     * Serves a subtitle file (.srt, .vtt) with proper MIME types and CORS headers.
+     */
+    private fun serveSubtitleFile(session: IHTTPSession, subFile: File): Response {
+        val length = subFile.length()
+        val ext = subFile.extension.lowercase(Locale.ROOT)
+        val mimeType = when (ext) {
+            "vtt" -> "text/vtt; charset=utf-8"
+            "srt" -> "text/srt; charset=utf-8"
+            else -> "text/plain; charset=utf-8"
+        }
+
+        if (session.method == Method.HEAD) {
+            val response = newFixedLengthResponse(Response.Status.OK, mimeType, null, length)
+            response.addHeader("Content-Length", length.toString())
+            response.addHeader("Access-Control-Allow-Origin", "*")
+            response.addHeader("Accept-Ranges", "bytes")
+            return response
+        }
+
+        return try {
+            val fis = FileInputStream(subFile)
+            val response = newFixedLengthResponse(Response.Status.OK, mimeType, fis, length)
+            response.addHeader("Content-Length", length.toString())
+            response.addHeader("Access-Control-Allow-Origin", "*")
+            response.addHeader("Accept-Ranges", "bytes")
+            response
+        } catch (e: Exception) {
+            Log.e(TAG, "Error serving subtitle: ${subFile.name}", e)
+            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Error reading subtitle")
+        }
+    }
+
+    /**
      * Serves file handling HTTP byte-range requests for DLNA seeking.
      */
-    private fun serveFileWithRanges(session: IHTTPSession, file: File): Response {
+    private fun serveFileWithRanges(
+        session: IHTTPSession,
+        file: File,
+        subtitleUrl: String? = null
+    ): Response {
         val fileLength = file.length()
         val mimeType = FileItem.guessMimeType(file.extension)
         val rangeHeader = session.headers["range"]
@@ -95,7 +188,7 @@ class DlnaMediaServer(
                 fileLength
             )
             response.addHeader("Content-Length", fileLength.toString())
-            addDlnaHeaders(response)
+            addDlnaHeaders(response, subtitleUrl)
             return response
         }
 
@@ -145,7 +238,7 @@ class DlnaMediaServer(
                 )
                 response.addHeader("Content-Range", "bytes $rangeStart-$rangeEnd/$fileLength")
                 response.addHeader("Content-Length", contentLength.toString())
-                addDlnaHeaders(response)
+                addDlnaHeaders(response, subtitleUrl)
                 return response
             } else {
                 // Full content request (200 OK)
@@ -157,7 +250,7 @@ class DlnaMediaServer(
                     fileLength
                 )
                 response.addHeader("Content-Length", fileLength.toString())
-                addDlnaHeaders(response)
+                addDlnaHeaders(response, subtitleUrl)
                 return response
             }
         } catch (e: IOException) {
@@ -166,7 +259,7 @@ class DlnaMediaServer(
         }
     }
 
-    private fun addDlnaHeaders(response: Response) {
+    private fun addDlnaHeaders(response: Response, subtitleUrl: String? = null) {
         response.addHeader("Accept-Ranges", "bytes")
         response.addHeader("transferMode.dlna.org", "Streaming")
         response.addHeader(
@@ -175,6 +268,11 @@ class DlnaMediaServer(
         )
         response.addHeader("Connection", "keep-alive")
         response.addHeader("Server", "DLNAPlayer/1.0 UPnP/1.0 DLNADOC/1.50")
+
+        // Samsung SEC DLNA subtitle header
+        if (!subtitleUrl.isNullOrBlank()) {
+            response.addHeader("CaptionInfo.sec", subtitleUrl)
+        }
     }
 
     companion object {

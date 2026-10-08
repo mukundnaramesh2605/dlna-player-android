@@ -5,7 +5,10 @@ import android.util.Log
 import com.dlnaplayer.android.model.DlnaDevice
 import com.dlnaplayer.android.model.FileItem
 import com.dlnaplayer.android.model.PlaybackState
+import com.dlnaplayer.android.model.SubtitleSource
+import com.dlnaplayer.android.model.SubtitleTrack
 import com.dlnaplayer.android.model.TransportState
+import com.dlnaplayer.android.repository.SubtitleRepository
 import com.dlnaplayer.android.server.DlnaMediaServer
 import com.dlnaplayer.android.util.NetworkUtils
 import kotlinx.coroutines.CoroutineScope
@@ -18,17 +21,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.File
 import java.io.IOException
 
 /**
  * High-level DLNA Controller managing device connection, local media server,
- * transport polling, playlist ordering, and volume control.
+ * transport polling, playlist ordering, volume control, and subtitle streaming.
  */
 class DlnaController(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
     private val soapClient = UPnPSoapClient()
+    private val subtitleRepo = SubtitleRepository()
     private var mediaServer: DlnaMediaServer? = null
     private var pollerJob: Job? = null
 
@@ -98,7 +103,10 @@ class DlnaController(
                         currentMedia = fileItem,
                         positionMs = 0L,
                         durationMs = 0L,
-                        errorMessage = null
+                        errorMessage = null,
+                        availableSubtitles = emptyList(),
+                        selectedSubtitle = SubtitleTrack.NONE,
+                        isExtractingSubtitle = false
                     )
                 }
 
@@ -117,7 +125,28 @@ class DlnaController(
                     return@launch
                 }
 
-                Log.d(TAG, "Streaming URL: $streamUrl -> ${device.friendlyName} (${device.ipAddress})")
+                val mediaId = mediaServer?.getMediaId(fileItem.file) ?: ""
+
+                // Discover available subtitles (embedded MKV tracks + external sidecar files)
+                val availableSubs = subtitleRepo.getAvailableSubtitles(fileItem.file)
+                val defaultSub = availableSubs.firstOrNull { it.isDefault } ?: SubtitleTrack.NONE
+                var initialSubUrl: String? = null
+
+                if (defaultSub.source !is SubtitleSource.None) {
+                    val subFile = subtitleRepo.prepareSubtitleFile(context, defaultSub)
+                    if (subFile != null && mediaId.isNotBlank()) {
+                        initialSubUrl = mediaServer?.registerSubtitle(mediaId, subFile)
+                    }
+                }
+
+                _playbackState.update {
+                    it.copy(
+                        availableSubtitles = availableSubs,
+                        selectedSubtitle = defaultSub
+                    )
+                }
+
+                Log.d(TAG, "Streaming URL: $streamUrl (Subtitle: $initialSubUrl) -> ${device.friendlyName} (${device.ipAddress})")
                 _playbackState.update { it.copy(streamUrl = streamUrl) }
 
                 var activeControlUrl = device.avTransportControlUrl
@@ -125,8 +154,8 @@ class DlnaController(
                 // Best-effort stop any previous track on the renderer
                 soapClient.stop(activeControlUrl)
 
-                // Set URI with DIDL metadata
-                var setUriResult = soapClient.setAVTransportURI(activeControlUrl, streamUrl, fileItem)
+                // Set URI with DIDL metadata and optional subtitle URL
+                var setUriResult = soapClient.setAVTransportURI(activeControlUrl, streamUrl, fileItem, initialSubUrl)
                 if (setUriResult.isFailure) {
                     // Try alternative Samsung/UPnP port if primary URL failed
                     val fallbackUrl = when {
@@ -136,7 +165,7 @@ class DlnaController(
                     }
                     if (fallbackUrl != null) {
                         Log.w(TAG, "Primary control URL failed. Retrying with fallback URL: $fallbackUrl")
-                        val fallbackResult = soapClient.setAVTransportURI(fallbackUrl, streamUrl, fileItem)
+                        val fallbackResult = soapClient.setAVTransportURI(fallbackUrl, streamUrl, fileItem, initialSubUrl)
                         if (fallbackResult.isSuccess) {
                             activeControlUrl = fallbackUrl
                             setUriResult = fallbackResult
@@ -256,6 +285,71 @@ class DlnaController(
         scope.launch(Dispatchers.IO) {
             soapClient.setMute(controlUrl, newMute)
         }
+    }
+
+    /**
+     * Selects and activates a subtitle track (embedded MKV or external file),
+     * updating the local streaming server and re-sending metadata to the renderer.
+     */
+    fun selectSubtitle(track: SubtitleTrack) {
+        val currentMedia = _playbackState.value.currentMedia ?: return
+        val server = mediaServer ?: return
+        val mediaId = server.getMediaId(currentMedia.file)
+
+        scope.launch(Dispatchers.IO) {
+            if (track.source is SubtitleSource.EmbeddedMkv) {
+                _playbackState.update { it.copy(isExtractingSubtitle = true) }
+            }
+
+            val subFile = subtitleRepo.prepareSubtitleFile(context, track)
+            val subUrl = server.registerSubtitle(mediaId, subFile)
+
+            _playbackState.update {
+                it.copy(
+                    selectedSubtitle = track,
+                    isExtractingSubtitle = false
+                )
+            }
+
+            // If a device is actively connected and playing, re-send transport URI with new subtitle
+            val device = _playbackState.value.targetDevice ?: return@launch
+            val streamUrl = _playbackState.value.streamUrl ?: return@launch
+            val activeControlUrl = device.avTransportControlUrl
+            val currentPos = _playbackState.value.positionMs
+            val isPlaying = _playbackState.value.isPlaying
+
+            Log.d(TAG, "Switched subtitle to: ${track.displayLabel} (URL: $subUrl)")
+            val setRes = soapClient.setAVTransportURI(activeControlUrl, streamUrl, currentMedia, subUrl)
+            if (setRes.isSuccess) {
+                if (currentPos > 0) {
+                    delay(350)
+                    seekTo(currentPos)
+                }
+                if (isPlaying) {
+                    soapClient.play(activeControlUrl)
+                }
+            }
+        }
+    }
+
+    /**
+     * Loads a user-selected external .srt or .vtt file from storage and activates it.
+     */
+    fun loadCustomExternalSubtitle(file: File) {
+        if (!file.exists() || !file.canRead()) return
+        val customTrack = SubtitleTrack(
+            id = "custom_${file.absolutePath.hashCode()}",
+            title = "External: ${file.name}",
+            source = SubtitleSource.ExternalFile(file)
+        )
+        _playbackState.update { current ->
+            val list = current.availableSubtitles.toMutableList()
+            if (list.none { it.id == customTrack.id }) {
+                list.add(customTrack)
+            }
+            current.copy(availableSubtitles = list)
+        }
+        selectSubtitle(customTrack)
     }
 
     fun playNext() {

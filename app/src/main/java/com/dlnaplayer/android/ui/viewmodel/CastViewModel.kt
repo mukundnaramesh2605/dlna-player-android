@@ -26,6 +26,7 @@ import kotlinx.coroutines.launch
 data class CastUiState(
     val showDevicePicker: Boolean = false,
     val showNowPlayingSheet: Boolean = false,
+    val showSubtitlePicker: Boolean = false,
     val snackbarMessage: String? = null
 )
 
@@ -197,6 +198,20 @@ class CastViewModel(
 
     fun setShowNowPlayingSheet(show: Boolean) {
         _uiState.update { it.copy(showNowPlayingSheet = show) }
+    }
+
+    fun setShowSubtitlePicker(show: Boolean) {
+        _uiState.update { it.copy(showSubtitlePicker = show) }
+    }
+
+    fun selectSubtitle(track: com.dlnaplayer.android.model.SubtitleTrack) {
+        controller.selectSubtitle(track)
+        showSnackbar("Subtitle set: ${track.displayLabel}")
+    }
+
+    fun loadExternalSubtitle(file: java.io.File) {
+        controller.loadCustomExternalSubtitle(file)
+        showSnackbar("Loaded external subtitle: ${file.name}")
     }
 
     fun showSnackbar(message: String) {

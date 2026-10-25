@@ -48,6 +48,7 @@ import com.dlnaplayer.android.ui.components.FolderBrowserScreen
 import com.dlnaplayer.android.ui.components.MiniPlayerBar
 import com.dlnaplayer.android.ui.components.NowPlayingSheet
 import com.dlnaplayer.android.ui.components.PermissionScreen
+import com.dlnaplayer.android.ui.components.ResumePlaybackDialog
 import com.dlnaplayer.android.ui.components.SubtitleSelectionBottomSheet
 import com.dlnaplayer.android.ui.theme.CastAccent
 import com.dlnaplayer.android.ui.theme.CastConnected
@@ -268,6 +269,9 @@ fun MainContent(
                     onToggleMediaFilter = { fileBrowserViewModel.togglePlayableMediaFilter() },
                     onSortChanged = { sortBy, sortOrder ->
                         fileBrowserViewModel.setSort(sortBy, sortOrder)
+                    },
+                    getPlaybackProgress = { path ->
+                        castViewModel.getPlaybackProgress(path)
                     }
                 )
             }
@@ -297,6 +301,8 @@ fun MainContent(
             onDisconnect = { castViewModel.disconnect() },
             onRefreshScan = { castViewModel.startScan() },
             onProbeManualIp = { castViewModel.probeManualIp(it) },
+            onRenameDevice = { ip, name -> castViewModel.renameDevice(ip, name) },
+            onForgetDevice = { ip -> castViewModel.forgetDevice(ip) },
             onDismiss = { castViewModel.setShowDevicePicker(false) }
         )
     }
@@ -334,6 +340,18 @@ fun MainContent(
                 subtitleFilePicker.launch(arrayOf("*/*", "text/*", "application/x-subrip"))
             },
             onDismiss = { castViewModel.setShowSubtitlePicker(false) }
+        )
+    }
+
+    // Resume Playback Dialog
+    if (castUiState.showResumeDialog && castUiState.pendingResumeItem != null) {
+        ResumePlaybackDialog(
+            fileItem = castUiState.pendingResumeItem!!,
+            positionMs = castUiState.pendingResumePositionMs,
+            durationMs = castUiState.pendingResumeDurationMs,
+            onResume = { castViewModel.confirmResume(true) },
+            onStartOver = { castViewModel.confirmResume(false) },
+            onDismiss = { castViewModel.dismissResumeDialog() }
         )
     }
 }

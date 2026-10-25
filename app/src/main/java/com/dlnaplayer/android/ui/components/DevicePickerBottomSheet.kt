@@ -24,10 +24,13 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.CastConnected
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Tv
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -67,12 +70,17 @@ fun DevicePickerBottomSheet(
     onDisconnect: () -> Unit,
     onRefreshScan: () -> Unit,
     onProbeManualIp: (String) -> Unit,
+    onRenameDevice: ((ip: String, newName: String) -> Unit)? = null,
+    onForgetDevice: ((ip: String) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var showManualIpInput by remember { mutableStateOf(false) }
     var manualIpText by remember { mutableStateOf("") }
     var isProbingManualIp by remember { mutableStateOf(false) }
+
+    var renamingDevice by remember { mutableStateOf<DlnaDevice?>(null) }
+    var renameInputText by remember { mutableStateOf("") }
 
     val infiniteTransition = rememberInfiniteTransition(label = "scan_spin")
     val rotation by infiniteTransition.animateFloat(
@@ -157,7 +165,7 @@ fun DevicePickerBottomSheet(
                             Spacer(modifier = Modifier.width(12.dp))
                             Column {
                                 Text(
-                                    text = currentDevice.friendlyName,
+                                    text = currentDevice.displayName,
                                     style = MaterialTheme.typography.bodyLarge,
                                     fontWeight = FontWeight.SemiBold
                                 )
@@ -315,11 +323,20 @@ fun DevicePickerBottomSheet(
             } else {
                 LazyColumn {
                     items(devices) { device ->
-                        val isSelected = currentDevice?.udn == device.udn
+                        val isSelected = currentDevice?.ipAddress == device.ipAddress || currentDevice?.udn == device.udn
                         DeviceListItem(
                             device = device,
                             isSelected = isSelected,
-                            onClick = { onSelectDevice(device) }
+                            onClick = { onSelectDevice(device) },
+                            onRename = if (onRenameDevice != null) {
+                                {
+                                    renamingDevice = device
+                                    renameInputText = device.displayName
+                                }
+                            } else null,
+                            onForget = if (onForgetDevice != null && device.isSaved) {
+                                { onForgetDevice.invoke(device.ipAddress) }
+                            } else null
                         )
                         HorizontalDivider(
                             modifier = Modifier.padding(start = 56.dp),
@@ -329,6 +346,49 @@ fun DevicePickerBottomSheet(
                 }
             }
         }
+
+        if (renamingDevice != null) {
+            AlertDialog(
+                onDismissRequest = { renamingDevice = null },
+                title = { Text("Rename Device") },
+                text = {
+                    Column {
+                        Text(
+                            text = "Give this device a constant custom name for future casting sessions:",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = renameInputText,
+                            onValueChange = { renameInputText = it },
+                            placeholder = { Text(renamingDevice?.friendlyName.orEmpty()) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val dev = renamingDevice
+                            if (dev != null && renameInputText.isNotBlank()) {
+                                onRenameDevice?.invoke(dev.ipAddress, renameInputText.trim())
+                            }
+                            renamingDevice = null
+                        },
+                        enabled = renameInputText.isNotBlank()
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { renamingDevice = null }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -336,7 +396,9 @@ fun DevicePickerBottomSheet(
 fun DeviceListItem(
     device: DlnaDevice,
     isSelected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onRename: (() -> Unit)? = null,
+    onForget: (() -> Unit)? = null
 ) {
     val isSpeaker = device.friendlyName.contains("speaker", ignoreCase = true) ||
             device.friendlyName.contains("audio", ignoreCase = true) ||
@@ -346,7 +408,7 @@ fun DeviceListItem(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick)
-            .padding(vertical = 12.dp),
+            .padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Surface(
@@ -366,12 +428,29 @@ fun DeviceListItem(
         Spacer(modifier = Modifier.width(16.dp))
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = device.friendlyName,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                color = if (isSelected) CastConnected else MaterialTheme.colorScheme.onSurface
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = device.displayName,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                    color = if (isSelected) CastConnected else MaterialTheme.colorScheme.onSurface
+                )
+                if (device.isSaved) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        modifier = Modifier.padding(horizontal = 2.dp)
+                    ) {
+                        Text(
+                            text = "Saved",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
             Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = device.subtitle,
@@ -385,8 +464,37 @@ fun DeviceListItem(
                 text = "Connected",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
-                color = CastConnected
+                color = CastConnected,
+                modifier = Modifier.padding(end = 4.dp)
             )
+        }
+
+        if (onRename != null) {
+            IconButton(
+                onClick = onRename,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Edit,
+                    contentDescription = "Rename device",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
+        if (onForget != null) {
+            IconButton(
+                onClick = onForget,
+                modifier = Modifier.size(36.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = "Forget device",
+                    tint = MaterialTheme.colorScheme.error.copy(alpha = 0.7f),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
         }
     }
 }

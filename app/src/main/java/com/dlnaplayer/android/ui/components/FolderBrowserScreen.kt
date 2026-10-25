@@ -39,6 +39,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -59,6 +60,8 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.dlnaplayer.android.model.FileItem
 import com.dlnaplayer.android.model.MediaType
+import com.dlnaplayer.android.model.PlaybackState
+import com.dlnaplayer.android.repository.PlaybackProgress
 import com.dlnaplayer.android.repository.SortBy
 import com.dlnaplayer.android.repository.SortOrder
 import com.dlnaplayer.android.ui.theme.CastAccent
@@ -81,6 +84,7 @@ fun FolderBrowserScreen(
     onToggleSearch: (Boolean) -> Unit,
     onToggleMediaFilter: () -> Unit,
     onSortChanged: (SortBy, SortOrder) -> Unit,
+    getPlaybackProgress: ((String) -> PlaybackProgress?)? = null,
     modifier: Modifier = Modifier
 ) {
     var showSortMenu by remember { mutableStateOf(false) }
@@ -213,6 +217,7 @@ fun FolderBrowserScreen(
                             } else {
                                 FileListItem(
                                     item = item,
+                                    playbackProgress = getPlaybackProgress?.invoke(item.path),
                                     onCastClick = { onCastMedia(item) },
                                     onNonCastableClick = { onNonCastableClicked(item) }
                                 )
@@ -358,10 +363,12 @@ fun FolderListItem(
 @Composable
 fun FileListItem(
     item: FileItem,
+    playbackProgress: PlaybackProgress? = null,
     onCastClick: () -> Unit,
     onNonCastableClick: () -> Unit
 ) {
     val isCastable = item.isCastable
+    val progress = playbackProgress?.takeIf { item.mediaType == MediaType.VIDEO && it.isResumeEligible }
 
     Row(
         modifier = Modifier
@@ -418,6 +425,19 @@ fun FileListItem(
                     modifier = Modifier.size(24.dp)
                 )
             }
+
+            // Watched progress bar overlay on video thumbnail
+            if (progress != null) {
+                LinearProgressIndicator(
+                    progress = { progress.progressFraction },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .align(Alignment.BottomCenter),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.width(16.dp))
@@ -440,6 +460,21 @@ fun FileListItem(
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (isCastable) 1f else 0.5f)
                 )
+
+                if (progress != null) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(4.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f)
+                    ) {
+                        Text(
+                            text = "Resume at ${PlaybackState.formatTime(progress.positionMs)}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
 
                 if (!isCastable) {
                     Spacer(modifier = Modifier.width(6.dp))

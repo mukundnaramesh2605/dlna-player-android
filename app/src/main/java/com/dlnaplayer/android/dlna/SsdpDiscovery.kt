@@ -5,6 +5,7 @@ import android.net.wifi.WifiManager
 import android.util.Log
 import android.util.Xml
 import com.dlnaplayer.android.model.DlnaDevice
+import com.dlnaplayer.android.repository.DeviceRepository
 import com.dlnaplayer.android.util.NetworkUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,8 +55,23 @@ class SsdpDiscovery(
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
     private val deviceMap = ConcurrentHashMap<String, DlnaDevice>()
+    private val deviceRepo = DeviceRepository(context)
     private var scanJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    init {
+        loadSavedDevices()
+    }
+
+    private fun loadSavedDevices() {
+        val saved = deviceRepo.getSavedDevices()
+        for (dev in saved) {
+            deviceMap[dev.ipAddress] = dev
+        }
+        _devices.value = deviceMap.values.toList().sortedWith(
+            compareByDescending<DlnaDevice> { it.isSaved }.thenBy { it.displayName }
+        )
+    }
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
@@ -126,7 +142,7 @@ class SsdpDiscovery(
 
     fun clearDevices() {
         deviceMap.clear()
-        _devices.value = emptyList()
+        loadSavedDevices()
     }
 
     /**
@@ -391,9 +407,65 @@ class SsdpDiscovery(
     }
 
     private fun addDevice(device: DlnaDevice) {
-        deviceMap[device.udn] = device
-        _devices.value = deviceMap.values.toList().sortedBy { it.friendlyName }
-        Log.i(TAG, "Registered DLNA Renderer: ${device.friendlyName} (${device.ipAddress})")
+        val ip = device.ipAddress.ifBlank {
+            try { URI(device.locationUrl).host ?: "" } catch (e: Exception) { "" }
+        }
+        if (ip.isBlank()) return
+
+        // Check if device is already saved or already discovered
+        val existing = deviceMap[ip]
+        val saved = deviceRepo.getSavedDevice(ip, device.udn)
+
+        // Determine constant friendly name & custom name
+        val customName = saved?.customName ?: existing?.customName ?: device.customName
+        val isSaved = saved != null || existing?.isSaved == true
+
+        // Clean raw friendly name (e.g. remove "[AV] " prefix)
+        val cleanedFriendlyName = if (existing?.friendlyName?.isNotBlank() == true && !existing.friendlyName.startsWith("[AV]")) {
+            deviceRepo.cleanFriendlyName(existing.friendlyName)
+        } else {
+            deviceRepo.cleanFriendlyName(device.friendlyName)
+        }
+
+        // Pick best control URLs (favor port 9197 or non-empty avTransportControlUrl)
+        val bestAvTransportUrl = when {
+            device.avTransportControlUrl.contains(":9197/") -> device.avTransportControlUrl
+            existing?.avTransportControlUrl?.contains(":9197/") == true -> existing.avTransportControlUrl
+            device.avTransportControlUrl.isNotBlank() -> device.avTransportControlUrl
+            else -> existing?.avTransportControlUrl.orEmpty()
+        }
+
+        val bestRenderingControlUrl = when {
+            device.renderingControlUrl?.contains(":9197/") == true -> device.renderingControlUrl
+            existing?.renderingControlUrl?.contains(":9197/") == true -> existing.renderingControlUrl
+            !device.renderingControlUrl.isNullOrBlank() -> device.renderingControlUrl
+            else -> existing?.renderingControlUrl
+        }
+
+        val bestUdn = if (device.udn.isNotBlank() && !device.udn.startsWith("uuid:samsung-")) {
+            device.udn
+        } else {
+            existing?.udn?.takeIf { it.isNotBlank() && !it.startsWith("uuid:samsung-") } ?: device.udn
+        }
+
+        val mergedDevice = device.copy(
+            udn = bestUdn,
+            friendlyName = cleanedFriendlyName,
+            customName = customName,
+            isSaved = isSaved,
+            ipAddress = ip,
+            avTransportControlUrl = bestAvTransportUrl,
+            renderingControlUrl = bestRenderingControlUrl,
+            manufacturer = if (device.manufacturer.isNotBlank()) device.manufacturer else existing?.manufacturer.orEmpty(),
+            modelName = if (device.modelName.isNotBlank()) device.modelName else existing?.modelName.orEmpty()
+        )
+
+        deviceMap[ip] = mergedDevice
+        _devices.value = deviceMap.values.toList().sortedWith(
+            compareByDescending<DlnaDevice> { it.isSaved }
+                .thenBy { it.displayName }
+        )
+        Log.i(TAG, "Registered DLNA Renderer: ${mergedDevice.displayName} ($ip)")
     }
 
     private fun parseSamsungRestApi(ip: String, json: String, client: OkHttpClient): DlnaDevice? {

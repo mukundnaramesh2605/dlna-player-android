@@ -4,10 +4,13 @@ import android.content.Context
 import android.util.Log
 import com.dlnaplayer.android.model.DlnaDevice
 import com.dlnaplayer.android.model.FileItem
+import com.dlnaplayer.android.model.MediaType
 import com.dlnaplayer.android.model.PlaybackState
 import com.dlnaplayer.android.model.SubtitleSource
 import com.dlnaplayer.android.model.SubtitleTrack
 import com.dlnaplayer.android.model.TransportState
+import com.dlnaplayer.android.repository.DeviceRepository
+import com.dlnaplayer.android.repository.PlaybackHistoryRepository
 import com.dlnaplayer.android.repository.SubtitleRepository
 import com.dlnaplayer.android.server.DlnaMediaServer
 import com.dlnaplayer.android.util.NetworkUtils
@@ -34,6 +37,8 @@ class DlnaController(
 ) {
     private val soapClient = UPnPSoapClient()
     private val subtitleRepo = SubtitleRepository()
+    val deviceRepo = DeviceRepository(context)
+    val playbackHistoryRepo = PlaybackHistoryRepository(context)
     private var mediaServer: DlnaMediaServer? = null
     private var pollerJob: Job? = null
 
@@ -52,17 +57,20 @@ class DlnaController(
             return
         }
 
+        // Persist device and mark as last connected for future casting
+        val savedDevice = deviceRepo.saveDevice(device)
+
         _playbackState.update {
-            it.copy(targetDevice = device, errorMessage = null)
+            it.copy(targetDevice = savedDevice, errorMessage = null)
         }
 
         // Fetch initial volume if device supports RenderingControl
-        if (device.renderingControlUrl != null) {
+        if (savedDevice.renderingControlUrl != null) {
             scope.launch(Dispatchers.IO) {
-                soapClient.getVolume(device.renderingControlUrl).onSuccess { vol ->
+                soapClient.getVolume(savedDevice.renderingControlUrl).onSuccess { vol ->
                     _playbackState.update { it.copy(volume = vol) }
                 }
-                soapClient.getMute(device.renderingControlUrl).onSuccess { muted ->
+                soapClient.getMute(savedDevice.renderingControlUrl).onSuccess { muted ->
                     _playbackState.update { it.copy(isMuted = muted) }
                 }
             }
@@ -80,11 +88,13 @@ class DlnaController(
     }
 
     /**
-     * Casts a file to the currently selected device, with optional playlist context.
+     * Casts a file to the currently selected device, with optional playlist context
+     * and optional start position for resuming.
      */
     fun castMedia(
         fileItem: FileItem,
-        playlist: List<FileItem> = listOf(fileItem)
+        playlist: List<FileItem> = listOf(fileItem),
+        startPositionMs: Long = 0L
     ) {
         val device = _playbackState.value.targetDevice
         if (device == null) {
@@ -197,6 +207,15 @@ class DlnaController(
 
                 _playbackState.update { it.copy(transportState = TransportState.PLAYING, errorMessage = null) }
                 startPoller(activeControlUrl)
+
+                // If resuming from a saved position, seek after brief delay
+                if (startPositionMs > 0L) {
+                    scope.launch(Dispatchers.IO) {
+                        delay(600)
+                        Log.i(TAG, "Resuming ${fileItem.name} at $startPositionMs ms")
+                        seekTo(startPositionMs)
+                    }
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "Error casting media", e)
                 _playbackState.update {
@@ -231,6 +250,14 @@ class DlnaController(
     fun stop() {
         val device = _playbackState.value.targetDevice
         stopPoller()
+
+        val currentMedia = _playbackState.value.currentMedia
+        val pos = _playbackState.value.positionMs
+        val dur = _playbackState.value.durationMs
+        if (currentMedia != null && currentMedia.mediaType == MediaType.VIDEO && pos > 0L) {
+            playbackHistoryRepo.saveProgress(currentMedia.path, pos, dur)
+        }
+
         if (device != null) {
             scope.launch(Dispatchers.IO) {
                 soapClient.stop(device.avTransportControlUrl)
@@ -390,6 +417,12 @@ class DlnaController(
                             durationMs = if (durMs > 0) durMs else current.durationMs
                         )
                     }
+
+                    // Periodically record playback progress for video resume
+                    val currentMedia = _playbackState.value.currentMedia
+                    if (currentMedia != null && currentMedia.mediaType == MediaType.VIDEO && relMs > 0L) {
+                        playbackHistoryRepo.saveProgress(currentMedia.path, relMs, durMs)
+                    }
                 }.onFailure {
                     consecutiveErrors++
                 }
@@ -405,13 +438,25 @@ class DlnaController(
                     }
                     _playbackState.update { it.copy(transportState = newState) }
 
-                    // Auto-advance playlist when stopped after reaching end of media
-                    if (newState == TransportState.STOPPED && _playbackState.value.positionMs > 0 &&
-                        _playbackState.value.durationMs > 0 &&
-                        (_playbackState.value.durationMs - _playbackState.value.positionMs) <= 3000
-                    ) {
-                        if (hasNext()) {
-                            launch(Dispatchers.Main) { playNext() }
+                    // Handle video end: clear progress and auto-advance
+                    if (newState == TransportState.STOPPED) {
+                        val media = _playbackState.value.currentMedia
+                        if (media != null && media.mediaType == MediaType.VIDEO) {
+                            val pos = _playbackState.value.positionMs
+                            val dur = _playbackState.value.durationMs
+                            if (dur > 0 && (dur - pos) <= 15000L) {
+                                playbackHistoryRepo.clearProgress(media.path)
+                            }
+                        }
+
+                        // Auto-advance playlist when stopped after reaching end of media
+                        if (_playbackState.value.positionMs > 0 &&
+                            _playbackState.value.durationMs > 0 &&
+                            (_playbackState.value.durationMs - _playbackState.value.positionMs) <= 3000
+                        ) {
+                            if (hasNext()) {
+                                launch(Dispatchers.Main) { playNext() }
+                            }
                         }
                     }
                 }

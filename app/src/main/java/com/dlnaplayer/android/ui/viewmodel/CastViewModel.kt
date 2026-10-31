@@ -31,6 +31,7 @@ data class CastUiState(
     val showDevicePicker: Boolean = false,
     val showNowPlayingSheet: Boolean = false,
     val showSubtitlePicker: Boolean = false,
+    val showAudioTrackPicker: Boolean = false,
     val showResumeDialog: Boolean = false,
     val pendingResumeItem: FileItem? = null,
     val pendingResumePositionMs: Long = 0L,
@@ -315,6 +316,15 @@ class CastViewModel(
     fun selectSubtitle(track: com.dlnaplayer.android.model.SubtitleTrack) {
         controller.selectSubtitle(track)
         showSnackbar("Subtitle set: ${track.displayLabel}")
+    }
+
+    fun setShowAudioTrackPicker(show: Boolean) {
+        _uiState.update { it.copy(showAudioTrackPicker = show) }
+    }
+
+    fun selectAudioTrack(track: com.dlnaplayer.android.model.AudioTrack) {
+        controller.selectAudioTrack(track)
+        showSnackbar("Switching audio to ${track.displayLabel}…")
     }
 
     fun loadExternalSubtitle(file: java.io.File) {

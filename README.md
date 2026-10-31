@@ -35,7 +35,13 @@ A native Android application built with **Kotlin**, **Jetpack Compose (Material 
    - Media-style notification with Play, Pause, and Stop actions to keep playback alive even when the app is backgrounded or the screen turns off.
    - `WakeLock` to prevent the device from entering deep sleep during an active cast session.
 
-6. **Full Storage Access & Graceful Permissions**:
+6. **Audio Track Selection**:
+   - When a video has more than one audio track, an audio chip appears in Now Playing; tap it to choose a language/commentary track.
+   - DLNA has no standard "switch audio stream" command, so the app serves the file with a **same-size header rewrite**: the chosen track is moved first and made the only default (MKV/WebM: `Tracks` entries + `FlagDefault`, CRC-32 kept valid; MP4/MOV/M4V: `trak` order in `moov` + `tkhd` enabled flag). Media data and all byte offsets are untouched, so seeking keeps working. Playback restarts on the TV and resumes at the same position.
+   - The chosen language is remembered for the rest of the session, so the next episode in the folder starts with it automatically.
+   - Other containers (TS, AVI, ...) list their tracks for information but can't be switched. Renderers that pick audio by their own language setting may ignore the file's default.
+
+7. **Full Storage Access & Graceful Permissions**:
    - Declares `MANAGE_EXTERNAL_STORAGE` for Android 11+ (API 30+) with a clear rationale screen directing the user to system settings.
    - Fallback runtime permission flow for `READ_EXTERNAL_STORAGE` on Android 10 and below, and granular media permissions (`READ_MEDIA_*`) on Android 13+.
    - Never crashes on permission denial; provides instant retry mechanisms.
@@ -56,15 +62,18 @@ The project follows a clean, decoupled **MVVM (Model-View-ViewModel)** architect
 │   ├── model/
 │   │   ├── FileItem.kt                 # Filesystem model & MIME categorization
 │   │   ├── DlnaDevice.kt               # Discovered UPnP MediaRenderer device
-│   │   └── PlaybackState.kt            # Real-time casting state & time helpers
+│   │   ├── PlaybackState.kt            # Real-time casting state & time helpers
+│   │   └── AudioTrack.kt               # Audio stream info (language, codec, channels)
 │   ├── repository/
 │   │   └── FileRepository.kt           # File system traversal, sorting, & filtering
 │   ├── server/
-│   │   └── DlnaMediaServer.kt          # NanoHTTPD byte-range streaming server
+│   │   ├── DlnaMediaServer.kt          # NanoHTTPD byte-range streaming server
+│   │   └── PatchedFileInputStream.kt   # Streams a file with a header patch overlaid
 │   ├── service/
 │   │   └── DlnaCastingService.kt       # Foreground media playback service
 │   ├── util/
-│   │   └── NetworkUtils.kt             # LAN IP resolver & MulticastLock manager
+│   │   ├── NetworkUtils.kt             # LAN IP resolver & MulticastLock manager
+│   │   └── AudioTrackSelector.kt       # MKV/MP4 audio track parser & header patcher
 │   └── ui/
 │       ├── MainActivity.kt             # TopAppBar, Cast button, & Scaffold
 │       ├── components/
@@ -72,6 +81,7 @@ The project follows a clean, decoupled **MVVM (Model-View-ViewModel)** architect
 │       │   ├── DevicePickerBottomSheet.kt # Discovered renderers sheet
 │       │   ├── MiniPlayerBar.kt        # Persistent bottom player bar
 │       │   ├── NowPlayingSheet.kt      # Full controls, seekbar, & volume
+│       │   ├── AudioTrackSelectionBottomSheet.kt # Audio track picker
 │       │   └── PermissionScreen.kt     # Storage permission rationale screen
 │       ├── theme/                      # Material 3 colors, typography, theme
 │       └── viewmodel/

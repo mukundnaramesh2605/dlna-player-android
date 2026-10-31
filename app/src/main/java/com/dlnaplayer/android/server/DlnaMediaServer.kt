@@ -2,6 +2,7 @@ package com.dlnaplayer.android.server
 
 import android.util.Log
 import com.dlnaplayer.android.model.FileItem
+import com.dlnaplayer.android.util.BytePatch
 import fi.iki.elonen.NanoHTTPD
 import java.io.File
 import java.io.FileInputStream
@@ -18,6 +19,8 @@ import java.util.concurrent.ConcurrentHashMap
  *  - DLNA streaming headers (transferMode.dlna.org, contentFeatures.dlna.org).
  *  - Serving external and extracted subtitle files (.srt, .vtt) with Samsung SEC caption headers.
  *  - Dynamic URL mapping for served files.
+ *  - Per-audio-track URL variants: the same file served with a header [BytePatch] applied,
+ *    so the renderer sees the chosen audio track as the default one.
  */
 class DlnaMediaServer(
     private val hostIp: String,
@@ -26,6 +29,7 @@ class DlnaMediaServer(
 
     private val mediaRegistry = ConcurrentHashMap<String, File>()
     private val subtitleRegistry = ConcurrentHashMap<String, File>()
+    private val patchRegistry = ConcurrentHashMap<String, BytePatch>()
 
     fun getMediaId(file: File): String {
         return file.absolutePath.hashCode().toString().replace("-", "x")
@@ -34,9 +38,18 @@ class DlnaMediaServer(
     /**
      * Registers a file and returns the full HTTP streaming URL for the DLNA renderer.
      */
-    fun registerMedia(file: File): String {
-        val id = getMediaId(file)
+    fun registerMedia(file: File): String = registerMediaVariant(file, null, null)
+
+    /**
+     * Registers a variant of [file] served with [patch] applied (e.g. a different default
+     * audio track). Each variant gets its own URL so renderers don't reuse cached headers.
+     * Subtitles stay keyed by the base media id and are shared by all variants.
+     */
+    fun registerMediaVariant(file: File, variant: Int?, patch: BytePatch?): String {
+        val baseId = getMediaId(file)
+        val id = if (variant != null && patch != null) "${baseId}a$variant" else baseId
         mediaRegistry[id] = file
+        if (patch != null && id != baseId) patchRegistry[id] = patch else patchRegistry.remove(id)
         val encodedName = URLEncoder.encode(file.name, "UTF-8").replace("+", "%20")
         return "http://$hostIp:$serverPort/media/$id/$encodedName"
     }
@@ -87,7 +100,7 @@ class DlnaMediaServer(
 
         // 2. Handle sidecar subtitle request on media path: /media/{id}/*.srt or *.vtt
         if (parts.size >= 2 && parts[0] == "media") {
-            val id = parts[1]
+            val id = baseMediaId(parts[1])
             val requestedName = parts.getOrNull(2)?.lowercase(Locale.ROOT)
             if (requestedName != null && (requestedName.endsWith(".srt") || requestedName.endsWith(".vtt") || requestedName.endsWith(".sub"))) {
                 val subFile = subtitleRegistry[id]
@@ -107,8 +120,9 @@ class DlnaMediaServer(
 
         val mediaId = getMediaId(targetFile)
         val activeSubtitleUrl = getSubtitleUrl(mediaId)
+        val patch = parts.getOrNull(1)?.takeIf { parts[0] == "media" }?.let { patchRegistry[it] }
 
-        return serveFileWithRanges(session, targetFile, activeSubtitleUrl)
+        return serveFileWithRanges(session, targetFile, activeSubtitleUrl, patch)
     }
 
     private fun resolveRequestedFile(uri: String, params: Map<String, List<String>>): File? {
@@ -174,7 +188,8 @@ class DlnaMediaServer(
     private fun serveFileWithRanges(
         session: IHTTPSession,
         file: File,
-        subtitleUrl: String? = null
+        subtitleUrl: String? = null,
+        patch: BytePatch? = null
     ): Response {
         val fileLength = file.length()
         val mimeType = FileItem.guessMimeType(file.extension)
@@ -225,10 +240,7 @@ class DlnaMediaServer(
                 rangeEnd = rangeEnd.coerceAtMost(fileLength - 1)
                 val contentLength = rangeEnd - rangeStart + 1
 
-                val fis = FileInputStream(file)
-                if (rangeStart > 0) {
-                    fis.skip(rangeStart)
-                }
+                val fis = PatchedFileInputStream(file, rangeStart, contentLength, patch)
 
                 val response = newFixedLengthResponse(
                     Response.Status.PARTIAL_CONTENT,
@@ -242,7 +254,7 @@ class DlnaMediaServer(
                 return response
             } else {
                 // Full content request (200 OK)
-                val fis = FileInputStream(file)
+                val fis = PatchedFileInputStream(file, 0L, fileLength, patch)
                 val response = newFixedLengthResponse(
                     Response.Status.OK,
                     mimeType,
@@ -275,8 +287,12 @@ class DlnaMediaServer(
         }
     }
 
+    /** Strips an audio-variant suffix ("…a2") so variants share the base media's subtitles. */
+    private fun baseMediaId(id: String): String = id.replace(VARIANT_SUFFIX, "")
+
     companion object {
         private const val TAG = "DlnaMediaServer"
+        private val VARIANT_SUFFIX = Regex("a\\d+$")
         const val DEFAULT_PORT = 8192
     }
 }

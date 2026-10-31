@@ -27,8 +27,17 @@ data class PlaybackState(
     val errorMessage: String? = null,
     val availableSubtitles: List<SubtitleTrack> = emptyList(),
     val selectedSubtitle: SubtitleTrack = SubtitleTrack.NONE,
-    val isExtractingSubtitle: Boolean = false
+    val isExtractingSubtitle: Boolean = false,
+    val availableAudioTracks: List<AudioTrack> = emptyList(),
+    /** The audio track the renderer is playing (the file's default until the user picks one). */
+    val selectedAudioTrack: AudioTrack? = null,
+    /** False for containers where we can list but not switch tracks. */
+    val canSwitchAudioTrack: Boolean = false,
+    val isSwitchingAudioTrack: Boolean = false
 ) {
+    val hasMultipleAudioTracks: Boolean
+        get() = availableAudioTracks.size > 1
+
     val isPlaying: Boolean
         get() = transportState == TransportState.PLAYING
 

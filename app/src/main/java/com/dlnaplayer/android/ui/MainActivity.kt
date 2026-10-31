@@ -49,6 +49,7 @@ import com.dlnaplayer.android.ui.components.MiniPlayerBar
 import com.dlnaplayer.android.ui.components.NowPlayingSheet
 import com.dlnaplayer.android.ui.components.PermissionScreen
 import com.dlnaplayer.android.ui.components.ResumePlaybackDialog
+import com.dlnaplayer.android.ui.components.AudioTrackSelectionBottomSheet
 import com.dlnaplayer.android.ui.components.SubtitleSelectionBottomSheet
 import com.dlnaplayer.android.ui.theme.CastAccent
 import com.dlnaplayer.android.ui.theme.CastConnected
@@ -322,7 +323,23 @@ fun MainContent(
             onSetVolume = { castViewModel.setVolume(it) },
             onToggleMute = { castViewModel.toggleMute() },
             onOpenSubtitles = { castViewModel.setShowSubtitlePicker(true) },
+            onOpenAudioTracks = { castViewModel.setShowAudioTrackPicker(true) },
             onDismiss = { castViewModel.setShowNowPlayingSheet(false) }
+        )
+    }
+
+    // Audio Track Selection Modal Bottom Sheet
+    if (castUiState.showAudioTrackPicker) {
+        AudioTrackSelectionBottomSheet(
+            audioTracks = playbackState.availableAudioTracks,
+            selectedTrack = playbackState.selectedAudioTrack,
+            canSwitch = playbackState.canSwitchAudioTrack,
+            isSwitching = playbackState.isSwitchingAudioTrack,
+            onSelectTrack = { track ->
+                castViewModel.selectAudioTrack(track)
+                castViewModel.setShowAudioTrackPicker(false)
+            },
+            onDismiss = { castViewModel.setShowAudioTrackPicker(false) }
         )
     }
 

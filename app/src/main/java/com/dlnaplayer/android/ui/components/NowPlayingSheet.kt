@@ -79,6 +79,7 @@ fun NowPlayingSheet(
     onSetVolume: (Int) -> Unit,
     onToggleMute: () -> Unit,
     onOpenSubtitles: () -> Unit,
+    onOpenAudioTracks: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val media = playbackState.currentMedia ?: return
@@ -127,6 +128,45 @@ fun NowPlayingSheet(
                 }
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Audio track button, shown when the file has more than one audio track
+                    if (playbackState.hasMultipleAudioTracks) {
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable(onClick = onOpenAudioTracks),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (playbackState.isSwitchingAudioTrack) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(12.dp),
+                                        strokeWidth = 2.dp,
+                                        color = CastAccent
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Audiotrack,
+                                        contentDescription = "Audio tracks",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = playbackState.selectedAudioTrack?.shortTag ?: "AUDIO",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+
                     // Subtitle / Closed Caption Button for Video
                     if (media.mediaType == MediaType.VIDEO) {
                         val hasSub = playbackState.hasActiveSubtitle

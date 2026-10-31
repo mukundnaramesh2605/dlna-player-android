@@ -2,6 +2,7 @@ package com.dlnaplayer.android.dlna
 
 import android.content.Context
 import android.util.Log
+import com.dlnaplayer.android.model.AudioTrack
 import com.dlnaplayer.android.model.DlnaDevice
 import com.dlnaplayer.android.model.FileItem
 import com.dlnaplayer.android.model.MediaType
@@ -9,6 +10,7 @@ import com.dlnaplayer.android.model.PlaybackState
 import com.dlnaplayer.android.model.SubtitleSource
 import com.dlnaplayer.android.model.SubtitleTrack
 import com.dlnaplayer.android.model.TransportState
+import com.dlnaplayer.android.repository.AudioTrackRepository
 import com.dlnaplayer.android.repository.DeviceRepository
 import com.dlnaplayer.android.repository.PlaybackHistoryRepository
 import com.dlnaplayer.android.repository.SubtitleRepository
@@ -26,10 +28,12 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.io.IOException
+import java.util.Locale
 
 /**
  * High-level DLNA Controller managing device connection, local media server,
- * transport polling, playlist ordering, volume control, and subtitle streaming.
+ * transport polling, playlist ordering, volume control, subtitle streaming,
+ * and audio track selection.
  */
 class DlnaController(
     private val context: Context,
@@ -37,6 +41,7 @@ class DlnaController(
 ) {
     private val soapClient = UPnPSoapClient()
     private val subtitleRepo = SubtitleRepository()
+    private val audioTrackRepo = AudioTrackRepository()
     val deviceRepo = DeviceRepository(context)
     val playbackHistoryRepo = PlaybackHistoryRepository(context)
     private var mediaServer: DlnaMediaServer? = null
@@ -47,6 +52,9 @@ class DlnaController(
 
     private var currentPlaylist: List<FileItem> = emptyList()
     private var currentPlaylistIndex: Int = -1
+
+    /** Language of the audio track last picked by the user; re-applied to the next items (e.g. episodes). */
+    private var preferredAudioLanguage: String? = null
 
     /**
      * Connects to a DLNA MediaRenderer device.
@@ -116,7 +124,11 @@ class DlnaController(
                         errorMessage = null,
                         availableSubtitles = emptyList(),
                         selectedSubtitle = SubtitleTrack.NONE,
-                        isExtractingSubtitle = false
+                        isExtractingSubtitle = false,
+                        availableAudioTracks = emptyList(),
+                        selectedAudioTrack = null,
+                        canSwitchAudioTrack = false,
+                        isSwitchingAudioTrack = false
                     )
                 }
 
@@ -124,8 +136,8 @@ class DlnaController(
                 val localIp = NetworkUtils.getLocalIpForTarget(device.ipAddress)
                 ensureMediaServerRunning(localIp)
 
-                val streamUrl = mediaServer?.registerMedia(fileItem.file)
-                if (streamUrl == null) {
+                val baseStreamUrl = mediaServer?.registerMedia(fileItem.file)
+                if (baseStreamUrl == null) {
                     _playbackState.update {
                         it.copy(
                             transportState = TransportState.ERROR,
@@ -153,6 +165,34 @@ class DlnaController(
                     it.copy(
                         availableSubtitles = availableSubs,
                         selectedSubtitle = defaultSub
+                    )
+                }
+
+                // Discover audio tracks. If the user picked a language earlier in this session,
+                // start directly with the matching track (served via a header-patched URL).
+                val audioScan = if (fileItem.mediaType != MediaType.IMAGE) {
+                    audioTrackRepo.getAudioTracks(fileItem.file)
+                } else null
+                val audioTracks = audioScan?.tracks.orEmpty()
+                var selectedAudio = audioTracks.firstOrNull { it.isDefault }
+                var streamUrl: String = baseStreamUrl
+                val preferredLang = preferredAudioLanguage
+                if (audioScan?.canSwitch == true && preferredLang != null && selectedAudio?.language != preferredLang) {
+                    val match = audioTracks.firstOrNull { it.language == preferredLang }
+                    val patch = match?.let { audioTrackRepo.buildPatch(fileItem.file, it) }
+                    val variantUrl = if (match != null && patch != null) {
+                        mediaServer?.registerMediaVariant(fileItem.file, match.index, patch)
+                    } else null
+                    if (variantUrl != null) {
+                        streamUrl = variantUrl
+                        selectedAudio = match
+                    }
+                }
+                _playbackState.update {
+                    it.copy(
+                        availableAudioTracks = audioTracks,
+                        selectedAudioTrack = selectedAudio,
+                        canSwitchAudioTrack = audioScan?.canSwitch == true
                     )
                 }
 
@@ -377,6 +417,97 @@ class DlnaController(
             current.copy(availableSubtitles = list)
         }
         selectSubtitle(customTrack)
+    }
+
+    /**
+     * Switches the renderer to another audio track.
+     *
+     * DLNA has no standard "change audio stream" action, so we re-send the media with a
+     * header-patched URL in which [track] is the first/default audio track (see
+     * [com.dlnaplayer.android.util.AudioTrackSelector]), then seek back to where playback was.
+     */
+    fun selectAudioTrack(track: AudioTrack) {
+        val state = _playbackState.value
+        val media = state.currentMedia ?: return
+        val server = mediaServer ?: return
+        if (state.targetDevice == null || !state.canSwitchAudioTrack || state.isSwitchingAudioTrack) return
+        if (track.index == state.selectedAudioTrack?.index) return
+
+        preferredAudioLanguage = track.language
+        scope.launch(Dispatchers.IO) {
+            _playbackState.update { it.copy(isSwitchingAudioTrack = true, errorMessage = null) }
+            try {
+                // The file's own default track needs no patch: serve the original bytes.
+                val newUrl = if (track.isDefault) {
+                    server.registerMedia(media.file)
+                } else {
+                    val patch = audioTrackRepo.buildPatch(media.file, track)
+                    if (patch == null) {
+                        _playbackState.update { it.copy(errorMessage = "Couldn't switch the audio track in this file") }
+                        return@launch
+                    }
+                    server.registerMediaVariant(media.file, track.index, patch)
+                }
+
+                val current = _playbackState.value
+                val controlUrl = current.targetDevice?.avTransportControlUrl ?: return@launch
+                val resumeAtMs = current.positionMs
+                val wasPaused = current.transportState == TransportState.PAUSED
+                val subtitleUrl = server.getSubtitleUrl(server.getMediaId(media.file))
+
+                stopPoller()
+                soapClient.stop(controlUrl)
+                val setResult = soapClient.setAVTransportURI(controlUrl, newUrl, media, subtitleUrl)
+                val playResult = if (setResult.isSuccess) soapClient.play(controlUrl) else setResult
+                if (playResult.isFailure) {
+                    val err = playResult.exceptionOrNull()?.message ?: "unknown error"
+                    Log.e(TAG, "Audio track switch failed: $err")
+                    _playbackState.update {
+                        it.copy(transportState = TransportState.ERROR, errorMessage = "Renderer rejected the audio track change: $err")
+                    }
+                    return@launch
+                }
+
+                _playbackState.update {
+                    it.copy(
+                        streamUrl = newUrl,
+                        selectedAudioTrack = track,
+                        transportState = TransportState.TRANSITIONING,
+                        positionMs = resumeAtMs
+                    )
+                }
+                Log.i(TAG, "Switched audio to ${track.displayLabel}; resuming at $resumeAtMs ms")
+
+                // Renderers generally ignore Seek until the new media is actually playing.
+                if (resumeAtMs > 0L && waitUntilPlaying(controlUrl)) {
+                    soapClient.seek(controlUrl, formatSeekTarget(resumeAtMs)).onFailure { err ->
+                        Log.w(TAG, "Seek after audio switch failed: ${err.message}")
+                    }
+                }
+                if (wasPaused) {
+                    soapClient.pause(controlUrl)
+                }
+                startPoller(controlUrl)
+            } finally {
+                _playbackState.update { it.copy(isSwitchingAudioTrack = false) }
+            }
+        }
+    }
+
+    private suspend fun waitUntilPlaying(controlUrl: String, timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val state = soapClient.getTransportInfo(controlUrl).getOrNull()?.currentTransportState
+            if (state.equals("PLAYING", ignoreCase = true)) return true
+            delay(300)
+        }
+        return false
+    }
+
+    /** REL_TIME target in the H+:MM:SS form required by AVTransport Seek. */
+    private fun formatSeekTarget(ms: Long): String {
+        val total = ms / 1000
+        return String.format(Locale.US, "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
 
     fun playNext() {
